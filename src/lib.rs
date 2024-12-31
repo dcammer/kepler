@@ -1,24 +1,18 @@
+mod errors;
 use async_std::sync::Mutex;
 use aws_config::meta::region::{ProvideRegion, RegionProviderChain};
 use aws_sdk_kinesis::primitives::Blob;
 use aws_sdk_kinesis::types::PutRecordsRequestEntry;
 use aws_sdk_kinesis::{Client, Error};
-use futures::future::FutureExt;
+pub use errors::KinesisSinkError;
+use futures::future::{BoxFuture, FutureExt};
 use futures::select;
 use std::sync::Arc;
 use tokio::task;
 use tokio::time::{sleep, Duration};
 use tracing::{debug, error, info};
 
-#[derive(thiserror::Error, Debug)]
-pub enum KinesisSinkError {
-    #[error("Error creating message: {0}")]
-    CreateMessageError(String),
-    #[error("Got error back from kinesis ({0}): {1}")]
-    ErrorFromKinesis(String, String),
-}
-
-pub type CallbackFunction = dyn Fn(&Result<(), KinesisSinkError>) + Send + Sync;
+pub type CallbackFunction = dyn Fn(&Result<(), KinesisSinkError>) -> BoxFuture<()> + Send + Sync;
 /// Specify how to handle the results.
 /// It is heavy handed to provide one type of response, so this creates a set of possible reponses
 #[derive(Clone)]
@@ -27,6 +21,7 @@ pub enum KinesisResultHandling {
     Ignore,
     /// Print to tracing logs
     Tracing,
+    #[cfg(feature = "callback")]
     /// Synchronous callback
     Callback(Arc<CallbackFunction>),
 }
@@ -40,12 +35,17 @@ pub struct KinesisMessage {
 }
 
 impl KinesisMessage {
-    pub fn new(stream_name: &str, partition_key: &str, data: &[u8]) -> KinesisMessage {
+    pub fn new(
+        stream_name: &str,
+        partition_key: &str,
+        data: &[u8],
+        results_handler: KinesisResultHandling,
+    ) -> KinesisMessage {
         KinesisMessage {
             stream_name: stream_name.to_string(),
             partition_key: partition_key.to_string(),
             data: data.into(),
-            result_handler: KinesisResultHandling::Tracing,
+            result_handler: results_handler,
         }
     }
 }
@@ -103,6 +103,12 @@ impl KinesisSinkProcess {
                     complete => last_loop = true,
                 };
                 if last_loop || msgs.len() >= batch_size || timed_out {
+                    debug!(
+                        "Last loop: {}, msgs len: {}, timed out: {}",
+                        last_loop,
+                        msgs.len(),
+                        timed_out
+                    );
                     send_messages(client.clone(), &msgs).await;
                     if last_loop {
                         break;
@@ -129,6 +135,7 @@ impl KinesisSinkProcess {
     async fn wait_stop(&mut self) {
         if self.spawned_thread.is_some() {
             let thread = self.spawned_thread.take();
+            debug!("Waiting for it to stop");
 
             if let Some(thread) = thread {
                 // Wait for the thread ot finish.
@@ -157,8 +164,9 @@ impl KinesisSink {
         stream_name: &str,
         partition_key: &str,
         data: &[u8],
+        results_handing: KinesisResultHandling,
     ) -> Result<(), async_channel::SendError<KinesisMessage>> {
-        let message = KinesisMessage::new(stream_name, partition_key, data);
+        let message = KinesisMessage::new(stream_name, partition_key, data, results_handing);
         self.send(message).await
     }
 
@@ -170,12 +178,15 @@ impl KinesisSink {
     }
 
     pub fn stop(&self) {
+        debug!("Stopping");
         self.sender.close();
     }
 
     pub async fn wait_done(&self) {
+        debug!("Wait done");
         let mut process = self.process.lock().await;
         process.wait_stop().await;
+        debug!("Done waiting");
     }
 }
 
@@ -201,6 +212,7 @@ async fn send_messages(client: Arc<Client>, msgs: &Vec<KinesisMessage>) {
             .collect();
 
         let rv = put_records(client.clone(), stream_name, records.to_vec()).await;
+        debug!("Put records returned {:?}", rv);
         match rv {
             Ok(response) => {
                 if let Some(failure_count) = response.failed_record_count {
@@ -218,6 +230,7 @@ async fn send_messages(client: Arc<Client>, msgs: &Vec<KinesisMessage>) {
                                         KinesisResultHandling::Tracing => {
                                             error!("{}", err_value);
                                         }
+                                        #[cfg(feature = "callback")]
                                         KinesisResultHandling::Callback(cb) => {
                                             let f = Arc::clone(cb);
                                             f(&Err(err_value));
@@ -236,10 +249,11 @@ async fn send_messages(client: Arc<Client>, msgs: &Vec<KinesisMessage>) {
                     match &msg.result_handler {
                         KinesisResultHandling::Ignore => {}
                         KinesisResultHandling::Tracing => error!("{}", err_value.to_string()),
+                        #[cfg(feature = "callback")]
                         KinesisResultHandling::Callback(cb) => {
                             let value = Err(err_value);
                             let f = Arc::clone(cb);
-                            f(&value);
+                            f(&value).await;
                         }
                     }
                 }
@@ -278,11 +292,19 @@ pub async fn create_kinesis_client(
 #[cfg(test)]
 mod test {
     use super::*;
+    use mockito::{Matcher, Server};
     use rstest::rstest;
+    #[cfg(feature = "callback")]
+    use std::sync::atomic::AtomicBool;
 
     #[rstest]
     fn new_message() {
-        let msg = KinesisMessage::new("hello", "help", "world".as_bytes());
+        let msg = KinesisMessage::new(
+            "hello",
+            "help",
+            "world".as_bytes(),
+            KinesisResultHandling::Ignore,
+        );
         assert_eq!("hello", msg.stream_name);
         assert_eq!("help", msg.partition_key);
         assert_eq!(5, msg.data.len());
@@ -296,5 +318,137 @@ mod test {
             .await
             .unwrap();
         assert!(!sink.sender.is_closed());
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn put_records_test() {
+        let mut server = Server::new_async().await;
+        let url = server.url();
+        let client = Arc::new(kinesis_test_client("default", &url).await);
+        let stream_name = "world";
+        let entry = PutRecordsRequestEntry::builder()
+            .data(Blob::new("hello"))
+            .partition_key("h")
+            .build()
+            .unwrap();
+
+        let records = vec![entry];
+        let rusoto_entry = rusoto_kinesis::PutRecordsRequestEntry {
+            data: "hello".into(),
+            partition_key: "h".to_string(),
+            explicit_hash_key: None,
+        };
+        let request = rusoto_kinesis::PutRecordsInput {
+            records: vec![rusoto_entry],
+            stream_name: stream_name.to_string(),
+        };
+        let my_json = serde_json::ser::to_string(&request).unwrap();
+        println!("Ouput:\n{}", my_json);
+
+        let mock = server
+            .mock("POST", "/")
+            .match_header("x-amz-target", Matcher::Exact(kinesis_api("PutRecords")))
+            .match_body(Matcher::JsonString(my_json))
+            .with_status(200)
+            .create_async()
+            .await;
+        let resp = put_records(client, stream_name, records).await.unwrap();
+        mock.expect(1).assert_async().await;
+        assert!(resp.failed_record_count.is_none());
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn put_records_invalid_stream() {
+        let mut server = Server::new_async().await;
+        let url = server.url();
+        let client = Arc::new(kinesis_test_client("default", &url).await);
+        let stream_name = "world";
+        let entry = PutRecordsRequestEntry::builder()
+            .data(Blob::new("hello"))
+            .partition_key("h")
+            .build()
+            .unwrap();
+
+        let records = vec![entry];
+        let response =
+            "ResourceNotFoundException: Stream world under account 000000000000 not found."
+                .to_string();
+        let my_response = r##"{"__type":"ResourceNotFoundException","message":"Stream world under account 000000000000 not found."}"##;
+
+        let mock = server
+            .mock("POST", "/")
+            .match_header("x-amz-target", Matcher::Exact(kinesis_api("PutRecords")))
+            .with_body(my_response.as_bytes())
+            .with_status(400)
+            .create_async()
+            .await;
+        let resp = put_records(client, stream_name, records).await.unwrap_err();
+        mock.expect(1).assert_async().await;
+        assert_eq!(response.to_string(), resp.to_string());
+    }
+
+    #[cfg(feature = "callback")]
+    #[rstest]
+    #[tokio::test]
+    async fn kinesis_sink_put_success_cb() {
+        let mut server = Server::new_async().await;
+        let url = server.url();
+        let client = kinesis_test_client("default", &url).await;
+        let stream_name = "world";
+        let rusoto_entry = rusoto_kinesis::PutRecordsRequestEntry {
+            data: "hello".into(),
+            partition_key: "h".to_string(),
+            explicit_hash_key: None,
+        };
+        let request = rusoto_kinesis::PutRecordsInput {
+            records: vec![rusoto_entry],
+            stream_name: stream_name.to_string(),
+        };
+        let my_json = serde_json::ser::to_string(&request).unwrap();
+
+        let mock = server
+            .mock("POST", "/")
+            .match_header("x-amz-target", Matcher::Exact(kinesis_api("PutRecords")))
+            .match_body(Matcher::JsonString(my_json))
+            .with_status(200)
+            .create_async()
+            .await;
+
+        let sink = KinesisSink::start(client).await.unwrap();
+        let success = Arc::new(Mutex::new(AtomicBool::new(false)));
+        let success_clone = success.clone();
+        sink.send_message(
+            stream_name,
+            "h",
+            "hello".as_bytes(),
+            KinesisResultHandling::Callback(Arc::new(move |result| {
+                Box::pin(async {
+                    let mut success_access = success_clone.lock().await;
+                    *success_access.get_mut() = result.is_ok();
+                })
+            })),
+        )
+        .await
+        .unwrap();
+        sink.stop();
+        sink.wait_done().await;
+        mock.expect(1).assert_async().await;
+        let got_ok = success.lock().await;
+        assert!(got_ok.into_inner());
+    }
+
+    async fn kinesis_test_client(profile_name: &str, endpoint: &str) -> Client {
+        let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+            .profile_name(profile_name)
+            .endpoint_url(endpoint)
+            .load()
+            .await;
+        aws_sdk_kinesis::Client::new(&config)
+    }
+
+    fn kinesis_api(name: &str) -> String {
+        format!("Kinesis_20131202.{}", name)
     }
 }

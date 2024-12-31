@@ -1,4 +1,5 @@
 use clap::{arg, value_parser, Command};
+use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 #[tokio::main]
 async fn main() {
@@ -36,14 +37,23 @@ async fn main() {
     let partition_key = matches.get_one::<String>("partition_key").unwrap().clone();
     let message = matches.get_one::<String>("message").unwrap().clone();
     let count = *matches.get_one::<usize>("count").unwrap();
-    env_logger::init();
+    tracing_subscriber::registry()
+        .with(fmt::layer())
+        .with(EnvFilter::from_default_env())
+        .init();
     let client = kepler::create_kinesis_client(&profile, "us-east-1").await;
     let sink = kepler::KinesisSink::start(client).await.unwrap();
+
     for _ in 0..count {
         let message = message.clone();
-        sink.send_message(&stream, &partition_key, &message.into_bytes())
-            .await
-            .unwrap();
+        sink.send_message(
+            &stream,
+            &partition_key,
+            &message.into_bytes(),
+            kepler::KinesisResultHandling::Tracing,
+        )
+        .await
+        .unwrap();
     }
     sink.stop();
     sink.wait_done().await;
