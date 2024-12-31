@@ -325,7 +325,7 @@ mod test {
     async fn put_records_test() {
         let mut server = Server::new_async().await;
         let url = server.url();
-        let client = Arc::new(kinesis_test_client("default", &url).await);
+        let client = Arc::new(kinesis_test_client(&url).await);
         let stream_name = "world";
         let entry = PutRecordsRequestEntry::builder()
             .data(Blob::new("hello"))
@@ -363,7 +363,7 @@ mod test {
     async fn put_records_invalid_stream() {
         let mut server = Server::new_async().await;
         let url = server.url();
-        let client = Arc::new(kinesis_test_client("default", &url).await);
+        let client = Arc::new(kinesis_test_client(&url).await);
         let stream_name = "world";
         let entry = PutRecordsRequestEntry::builder()
             .data(Blob::new("hello"))
@@ -439,9 +439,10 @@ mod test {
         assert!(got_ok.into_inner());
     }
 
-    async fn kinesis_test_client(profile_name: &str, endpoint: &str) -> Client {
+    async fn kinesis_test_client(endpoint: &str) -> Client {
         let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
-            .profile_name(profile_name)
+            .region("us-east-1")
+            .test_credentials()
             .endpoint_url(endpoint)
             .load()
             .await;
